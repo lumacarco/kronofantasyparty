@@ -335,6 +335,9 @@ function joinParty(session, party, payload = {}) {
   }
 
   upsertPartyMember(session, party, payload);
+  if (session.pendingInvites && session.pendingInvites.size) {
+    session.pendingInvites.clear();
+  }
   joinRoom(session, rooms.get(party.roomId));
   return party;
 }
@@ -700,6 +703,14 @@ function handlePresenceInvite(session, payload, requestId) {
   const targetSession = clients.get(targetClientId);
   if (!targetSession) {
     sendError(session, 'target_offline', 'Il client selezionato non e piu online', requestId, { targetClientId });
+    return;
+  }
+
+  if (targetSession.partyId && targetSession.partyId !== party.id) {
+    sendError(session, 'target_busy', 'Questo client e gia dentro un altro party', requestId, {
+      targetClientId,
+      partyId: targetSession.partyId,
+    });
     return;
   }
 
