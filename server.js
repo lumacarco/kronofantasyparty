@@ -1,8 +1,13 @@
 const WebSocket = require('ws');
 
 const PORT = process.env.PORT || 8080;
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'https://kronofantasy.net';
 
-const wss = new WebSocket.Server({ port: PORT });
+function verifyClient({ origin }) {
+  return origin === ALLOWED_ORIGIN;
+}
+
+const wss = new WebSocket.Server({ port: PORT, verifyClient });
 
 wss.on('listening', () => {
   console.log(`WebSocket server listening on port ${PORT}`);
