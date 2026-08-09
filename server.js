@@ -8,7 +8,7 @@ const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || 30000);
 const MAX_MESSAGE_SIZE = Number(process.env.MAX_MESSAGE_SIZE || 16 * 1024);
 const MAX_CHAT_LENGTH = Number(process.env.MAX_CHAT_LENGTH || 400);
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS
-  || 'https://kronofantasy.net,https://www.kronofantasy.net,http://localhost:3000,http://localhost:5173')
+  || 'https://kronofantasy.net,https://www.kronofantasy.net,http://kronofantasy.net,http://www.kronofantasy.net,http://localhost:3000,http://localhost:5173')
   .split(',')
   .map((value) => value.trim())
   .filter(Boolean);
@@ -914,8 +914,17 @@ const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_MESSAGE_SIZE }
 
 server.on('upgrade', (request, socket, head) => {
   const origin = request.headers.origin || '';
+  const pathname = new URL(request.url || '/', 'http://localhost').pathname;
+
   if (!originAllowed(origin)) {
-    socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+    socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  // Accetta sia wss://host/ sia wss://host/ws
+  if (pathname !== '/' && pathname !== '/ws') {
+    socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
     socket.destroy();
     return;
   }
