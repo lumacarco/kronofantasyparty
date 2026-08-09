@@ -96,6 +96,50 @@ function publicClient(session) {
   };
 }
 
+function publicPresence(session) {
+  const party = session.partyId ? parties.get(session.partyId) : null;
+  const member = party ? party.members.get(session.id) : null;
+  return {
+    clientId: session.id,
+    accountName: sanitizeText(session.accountName, 32, session.name || 'Giocatore'),
+    name: session.name,
+    playerId: session.playerId,
+    saveId: session.saveId,
+    avatar: session.avatar,
+    joinedAt: session.joinedAt,
+    live: true,
+    partyId: session.partyId,
+    partyName: party ? party.name : '',
+    partyRole: member ? member.role : '',
+    status: member ? member.status : 'online',
+    level: member && Number.isFinite(member.level) ? member.level : Number(session.meta?.level || 0),
+    mapId: member ? member.mapId : sanitizeId(session.meta?.mapId, ''),
+    meta: {
+      ...safePayload(session.meta),
+      accountName: sanitizeText(session.accountName, 32, session.name || 'Giocatore'),
+    },
+  };
+}
+
+function listActiveClients() {
+  return Array.from(clients.values())
+    .map((session) => publicPresence(session))
+    .sort((left, right) => {
+      const leftName = `${left.accountName} ${left.name}`.trim().toLowerCase();
+      const rightName = `${right.accountName} ${right.name}`.trim().toLowerCase();
+      return leftName.localeCompare(rightName);
+    });
+}
+
+function broadcastPresenceUpdate(reason = 'refresh') {
+  const online = listActiveClients();
+  broadcastToSessions(clients.keys(), 'presence.updated', {
+    online,
+    total: online.length,
+    reason,
+  });
+}
+
 function roomSnapshot(room) {
   return {
     roomId: room.id,
@@ -291,6 +335,9 @@ function joinParty(session, party, payload = {}) {
   }
 
   upsertPartyMember(session, party, payload);
+  if (session.pendingInvites && session.pendingInvites.size) {
+    session.pendingInvites.clear();
+  }
   joinRoom(session, rooms.get(party.roomId));
   return party;
 }
@@ -336,6 +383,7 @@ function leaveParty(session, reason = 'left') {
     party: partySnapshot(party),
     reason,
   });
+  broadcastPresenceUpdate(reason);
 
   return party;
 }
@@ -441,6 +489,7 @@ function handlePartyCreate(session, payload, requestId) {
   const party = createParty(session, payload);
   joinParty(session, party, payload.member || {});
   sendToSession(session, 'party.joined', { party: partySnapshot(party) }, requestId);
+  broadcastPresenceUpdate('party_create');
 }
 
 function handlePartyJoin(session, payload, requestId) {
@@ -450,13 +499,18 @@ function handlePartyJoin(session, payload, requestId) {
     return;
   }
 
-  if (!party.isOpen && !party.members.has(session.id)) {
+  const hasInvite = !!(session.pendingInvites && session.pendingInvites.has(party.id));
+
+  if (!party.isOpen && !party.members.has(session.id) && !hasInvite) {
     sendError(session, 'party_closed', 'Questo party e chiuso a nuovi ingressi', requestId, { partyId: party.id });
     return;
   }
 
   try {
     joinParty(session, party, payload.member || {});
+    if (hasInvite) {
+      session.pendingInvites.delete(party.id);
+    }
   } catch (error) {
     sendError(session, 'party_conflict', error.message, requestId);
     return;
@@ -464,6 +518,7 @@ function handlePartyJoin(session, payload, requestId) {
 
   broadcastParty(party, 'party.updated', { party: partySnapshot(party) });
   sendToSession(session, 'party.joined', { party: partySnapshot(party) }, requestId);
+  broadcastPresenceUpdate('party_join');
 }
 
 function handlePartyLeave(session, requestId) {
@@ -482,6 +537,7 @@ function handlePartyMemberState(session, payload, requestId) {
   upsertPartyMember(session, party, payload);
   broadcastParty(party, 'party.updated', { party: partySnapshot(party) });
   sendToSession(session, 'party.member_state_saved', { partyId: party.id }, requestId);
+  broadcastPresenceUpdate('member_state');
 }
 
 function handlePartyState(session, payload, requestId) {
@@ -562,6 +618,7 @@ function handlePartyKick(session, payload, requestId) {
 
   broadcastParty(party, 'party.updated', { party: partySnapshot(party) });
   sendToSession(session, 'party.member_kicked', { partyId: party.id, memberId }, requestId);
+  broadcastPresenceUpdate('party_kick');
 }
 
 function handlePartyOpen(session, payload, requestId) {
@@ -580,6 +637,113 @@ function handlePartyOpen(session, payload, requestId) {
   party.updatedAt = nowIso();
   broadcastParty(party, 'party.updated', { party: partySnapshot(party) });
   sendToSession(session, 'party.visibility_saved', { partyId: party.id, isOpen: party.isOpen }, requestId);
+  broadcastPresenceUpdate('party_visibility');
+}
+
+function handlePartyLeader(session, payload, requestId) {
+  const party = session.partyId ? parties.get(session.partyId) : null;
+  if (!party) {
+    sendError(session, 'party_required', 'Devi essere in un party', requestId);
+    return;
+  }
+
+  if (party.leaderId !== session.id) {
+    sendError(session, 'party_leader_required', 'Solo il leader puo cedere la leadership', requestId);
+    return;
+  }
+
+  const memberId = sanitizeId(payload.memberId);
+  if (!memberId || memberId === session.id || !party.members.has(memberId)) {
+    sendError(session, 'invalid_member', 'Membro non valido per il cambio leader', requestId, { memberId });
+    return;
+  }
+
+  party.leaderId = memberId;
+  for (const member of party.members.values()) {
+    member.role = member.clientId === party.leaderId ? 'leader' : 'member';
+  }
+  party.updatedAt = nowIso();
+
+  broadcastParty(party, 'party.updated', {
+    party: partySnapshot(party),
+    reason: 'leader_changed',
+    by: session.id,
+    leaderId: party.leaderId,
+  });
+  sendToSession(session, 'party.leader_saved', { partyId: party.id, leaderId: party.leaderId }, requestId);
+  broadcastPresenceUpdate('leader_changed');
+}
+
+function handlePresenceList(session, requestId) {
+  const online = listActiveClients();
+  sendToSession(session, 'presence.listed', {
+    online,
+    total: online.length,
+  }, requestId);
+}
+
+function handlePresenceInvite(session, payload, requestId) {
+  const party = session.partyId ? parties.get(session.partyId) : null;
+  if (!party) {
+    sendError(session, 'party_required', 'Crea o entra prima in un party per invitare altri client', requestId);
+    return;
+  }
+
+  if (party.leaderId !== session.id) {
+    sendError(session, 'party_leader_required', 'Solo il leader puo invitare altri client dal pannello presenti', requestId);
+    return;
+  }
+
+  const targetClientId = sanitizeId(payload.targetClientId);
+  if (!targetClientId || targetClientId === session.id) {
+    sendError(session, 'invalid_target', 'Target invito non valido', requestId, { targetClientId });
+    return;
+  }
+
+  const targetSession = clients.get(targetClientId);
+  if (!targetSession) {
+    sendError(session, 'target_offline', 'Il client selezionato non e piu online', requestId, { targetClientId });
+    return;
+  }
+
+  if (targetSession.partyId && targetSession.partyId !== party.id) {
+    sendError(session, 'target_busy', 'Questo client e gia dentro un altro party', requestId, {
+      targetClientId,
+      partyId: targetSession.partyId,
+    });
+    return;
+  }
+
+  if (targetSession.partyId === party.id) {
+    sendError(session, 'already_same_party', 'Questo client e gia nel tuo party', requestId, { targetClientId, partyId: party.id });
+    return;
+  }
+
+  if (targetSession.pendingInvites.has(party.id)) {
+    sendError(session, 'invite_already_sent', 'Hai gia inviato un invito a questo client per il tuo party', requestId, { targetClientId, partyId: party.id });
+    return;
+  }
+
+  targetSession.pendingInvites.add(party.id);
+
+  sendToSession(targetSession, 'presence.invited', {
+    from: publicPresence(session),
+    party: {
+      partyId: party.id,
+      code: party.code,
+      name: party.name,
+      leaderId: party.leaderId,
+      isOpen: party.isOpen,
+      members: party.members.size,
+    },
+    createdAt: nowIso(),
+  });
+
+  sendToSession(session, 'presence.invite_sent', {
+    targetClientId,
+    targetName: sanitizeText(targetSession.accountName, 32, targetSession.name || 'Client'),
+    partyId: party.id,
+  }, requestId);
 }
 
 function cleanupSession(session, reason = 'disconnect') {
@@ -595,6 +759,7 @@ function cleanupSession(session, reason = 'disconnect') {
 
   clients.delete(session.id);
   console.log(`[disconnect] ${session.id} (${session.name}) reason=${reason}`);
+  broadcastPresenceUpdate(reason);
 }
 
 function handleMessage(session, rawMessage) {
@@ -629,6 +794,7 @@ function handleMessage(session, rawMessage) {
       session.playerId = sanitizeId(payload.playerId, session.playerId);
       session.saveId = sanitizeText(payload.saveId, 80, session.saveId);
       session.name = sanitizeText(payload.name, 32, session.name || 'Giocatore');
+      session.accountName = sanitizeText(payload.accountName, 32, session.accountName || session.name || 'Giocatore');
       session.avatar = sanitizeText(payload.avatar, 120, session.avatar);
       session.meta = {
         ...session.meta,
@@ -642,6 +808,15 @@ function handleMessage(session, rawMessage) {
       }
 
       sendToSession(session, 'identify.saved', { client: publicClient(session) }, requestId);
+      broadcastPresenceUpdate('identify');
+      break;
+
+    case 'presence.list':
+      handlePresenceList(session, requestId);
+      break;
+
+    case 'presence.invite':
+      handlePresenceInvite(session, payload, requestId);
       break;
 
     case 'chat.list':
@@ -704,6 +879,10 @@ function handleMessage(session, rawMessage) {
       handlePartyOpen(session, payload, requestId);
       break;
 
+    case 'party.leader':
+      handlePartyLeader(session, payload, requestId);
+      break;
+
     default:
       sendError(session, 'unknown_type', `Tipo messaggio non gestito: ${type}`, requestId);
       break;
@@ -753,16 +932,19 @@ wss.on('connection', (ws, req) => {
     playerId: null,
     saveId: null,
     name: 'Giocatore',
+    accountName: 'Giocatore',
     avatar: null,
     joinedAt: nowIso(),
     partyId: null,
     rooms: new Set(),
+    pendingInvites: new Set(),
     meta: {},
     isAlive: true,
   };
 
   clients.set(session.id, session);
   console.log(`[connect] ${session.id} origin=${req.headers.origin || 'unknown'}`);
+  broadcastPresenceUpdate('connect');
 
   sendToSession(session, 'session.welcome', {
     clientId: session.id,
